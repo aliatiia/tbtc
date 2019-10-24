@@ -450,7 +450,7 @@ contract('DepositFunding', (accounts) => {
 
     it('updates to active, stores UTXO info, deconstes funding info, logs Funded', async () => {
       const blockNumber = await web3.eth.getBlock('latest').number
-  
+
       await testInstance.provideBTCFundingProof(
         _versionLegacy,
         _txInputVectorLegacy,
