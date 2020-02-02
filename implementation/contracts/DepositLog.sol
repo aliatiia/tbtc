@@ -82,9 +82,9 @@ contract DepositLog {
         uint256 _timestamp
     );
 
-    ///
-    /// AUTH
-    ///
+    //
+    // AUTH
+    //
 
     /// @notice             Checks if an address is an allowed logger
     /// @dev                Calls the system to check if the caller is a Deposit
@@ -92,15 +92,15 @@ contract DepositLog {
     /// @param  _caller     The address of the calling contract
     /// @return             True if approved, otherwise false
     /* solium-disable-next-line no-empty-blocks */
-    function approvedToLog(address _caller) public view returns (bool) {
+    function approvedToLog(address _caller) public pure returns (bool) {
         /* TODO: auth via system */
         _caller;
         return true;
     }
 
-    ///
-    /// Logging
-    ///
+    //
+    // Logging
+    //
 
     /// @notice               Fires a Created event
     /// @dev                  We append the sender, which is the deposit contract that called

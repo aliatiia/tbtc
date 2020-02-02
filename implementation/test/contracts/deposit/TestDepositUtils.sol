@@ -4,6 +4,9 @@ import {DepositUtils} from '../../../contracts/deposit/DepositUtils.sol';
 import {TestDeposit} from './TestDeposit.sol';
 
 contract TestDepositUtils is TestDeposit {
+    constructor(address _factoryAddress) 
+        TestDeposit(_factoryAddress)
+    public{}
 
     // Passthroughs to test view and pure functions
 
@@ -69,16 +72,8 @@ contract TestDepositUtils is TestDeposit {
         return self.auctionValue();
     }
 
-    function signerFee() public pure returns (uint256) {
-        return DepositUtils.signerFee();
-    }
-
-    function beneficiaryReward() public pure returns (uint256) {
-        return DepositUtils.beneficiaryReward();
-    }
-
-    function redemptionTBTCAmount() public view returns (uint256) {
-        return self.redemptionTBTCAmount();
+    function signerFee() public view returns (uint256) {
+        return self.signerFee();
     }
 
     function auctionTBTCAmount() public view returns (uint256) {
@@ -105,8 +100,8 @@ contract TestDepositUtils is TestDeposit {
         return self.utxoSize();
     }
 
-    function fetchOraclePrice() public view returns (uint256) {
-        return self.fetchOraclePrice();
+    function fetchBitcoinPrice() public view returns (uint256) {
+        return self.fetchBitcoinPrice();
     }
 
     function fetchBondAmount() public view returns (uint256) {
@@ -117,8 +112,8 @@ contract TestDepositUtils is TestDeposit {
         return DepositUtils.bytes8LEToUint(_b);
     }
 
-    function depositBeneficiary() public view returns (address payable) {
-        return self.depositBeneficiary();
+    function feeRebateTokenHolder() public view returns (address payable) {
+        return self.feeRebateTokenHolder();
     }
 
     function redemptionTeardown() public {
@@ -129,8 +124,8 @@ contract TestDepositUtils is TestDeposit {
         return self.seizeSignerBonds();
     }
 
-    function distributeBeneficiaryReward() public {
-        return self.distributeBeneficiaryReward();
+    function distributeFeeRebate() public {
+        return self.distributeFeeRebate();
     }
 
     function pushFundsToKeepGroup(uint256 _ethValue) public returns (bool) {

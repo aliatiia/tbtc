@@ -25,14 +25,14 @@ library DepositFunding {
 
     /// @notice     Deletes state after funding
     /// @dev        This is called when we go to ACTIVE or setup fails without fraud
-    function fundingTeardown(DepositUtils.Deposit storage _d) public {
+    function fundingTeardown(DepositUtils.Deposit storage _d) internal {
         _d.signingGroupRequestedAt = 0;
         _d.fundingProofTimerStart = 0;
     }
 
     /// @notice     Deletes state after the funding ECDSA fraud process
     /// @dev        This is only called as we transition to setup failed
-    function fundingFraudTeardown(DepositUtils.Deposit storage _d) public {
+    function fundingFraudTeardown(DepositUtils.Deposit storage _d) internal {
         _d.keepAddress = address(0);
         _d.signingGroupRequestedAt = 0;
         _d.fundingProofTimerStart = 0;
@@ -49,16 +49,23 @@ library DepositFunding {
     function createNewDeposit(
         DepositUtils.Deposit storage _d,
         uint256 _m,
-        uint256 _n
+        uint256 _n,
+        uint256 _lotSize
     ) public returns (bool) {
+        TBTCSystem _system = TBTCSystem(_d.TBTCSystem);
+
+        require(_system.getAllowNewDeposits(), "Opening new deposits is currently disabled.");
         require(_d.inStart(), "Deposit setup already requested");
         /* solium-disable-next-line value-in-payable */
         require(msg.value == TBTCConstants.getFunderBondAmount(), "incorrect funder bond amount");
-
+        require(_system.isAllowedLotSize(_lotSize), "provided lot size not supported");
         // TODO: Whole value is stored as funder bond in the deposit, but part
         // of it should be transferred to keep: https://github.com/keep-network/tbtc/issues/297
-        _d.keepAddress = TBTCSystem(_d.TBTCSystem).requestNewKeep(_m, _n);
-
+        _d.lotSizeSatoshis = _lotSize;
+        _d.keepAddress = _system.requestNewKeep(_m, _n);
+        _d.signerFeeDivisor = _system.getSignerFeeDivisor();
+        _d.undercollateralizedThresholdPercent = _system.getUndercollateralizedThresholdPercent();
+        _d.severelyUndercollateralizedThresholdPercent = _system.getSeverelyUndercollateralizedThresholdPercent();
         _d.signingGroupRequestedAt = block.timestamp;
 
         _d.setAwaitingSignerSetup();
@@ -69,7 +76,7 @@ library DepositFunding {
 
     /// @notice     Transfers the funders bond to the signers if the funder never funds
     /// @dev        Called only by notifyFundingTimeout
-    function revokeFunderBond(DepositUtils.Deposit storage _d) public {
+    function revokeFunderBond(DepositUtils.Deposit storage _d) internal {
         if (address(this).balance >= TBTCConstants.getFunderBondAmount()) {
             _d.pushFundsToKeepGroup(TBTCConstants.getFunderBondAmount());
         } else if (address(this).balance > 0) {
@@ -79,45 +86,28 @@ library DepositFunding {
 
     /// @notice     Returns the funder's bond plus a payment at contract teardown
     /// @dev        Returns the balance if insufficient. Always call this before distributing signer payments
-    function returnFunderBond(DepositUtils.Deposit storage _d) public {
+    function returnFunderBond(DepositUtils.Deposit storage _d) internal {
         if (address(this).balance >= TBTCConstants.getFunderBondAmount()) {
-            _d.depositBeneficiary().transfer(TBTCConstants.getFunderBondAmount());
+            _d.depositOwner().transfer(TBTCConstants.getFunderBondAmount());
         } else if (address(this).balance > 0) {
-            _d.depositBeneficiary().transfer(address(this).balance);
+            _d.depositOwner().transfer(address(this).balance);
         }
-    }
-
-    /// @notice     Mints TBTC tokens.
-    /// @dev        Minted value is based on a configured lot size. The lot size,
-    /// which is specified in satoshi is multiplied to match TBTC token unit.
-    /// Minted tokens are split between the beneficiary (99,5%) and the deposit
-    /// contract (0,5%).
-    function mintTBTC(DepositUtils.Deposit storage _d) internal {
-        TBTCToken _tbtcToken = TBTCToken(_d.TBTCToken);
-
-        uint256 _multiplier = TBTCConstants.getSatoshiMultiplier();
-        uint256 _signerFee = DepositUtils.signerFee();
-
-        uint256 _totalValue = TBTCConstants.getLotSize().mul(_multiplier);
-
-        _tbtcToken.mint(_d.depositBeneficiary(), _totalValue.sub(_signerFee));
-        _tbtcToken.mint(address(this), _signerFee);
     }
 
     /// @notice     slashes the signers partially for committing fraud before funding occurs
     /// @dev        called only by notifyFraudFundingTimeout
-    function partiallySlashForFraudInFunding(DepositUtils.Deposit storage _d) public {
+    function partiallySlashForFraudInFunding(DepositUtils.Deposit storage _d) internal {
         uint256 _seized = _d.seizeSignerBonds();
         uint256 _slash = _seized.div(TBTCConstants.getFundingFraudPartialSlashDivisor());
         _d.pushFundsToKeepGroup(_seized.sub(_slash));
-        _d.depositBeneficiary().transfer(_slash);
+        _d.depositOwner().transfer(_slash);
     }
 
     /// @notice     Seizes signer bonds and distributes them to the funder
     /// @dev        This is only called as part of funding fraud flow
-    function distributeSignerBondsToFunder(DepositUtils.Deposit storage _d) public {
+    function distributeSignerBondsToFunder(DepositUtils.Deposit storage _d) internal {
         uint256 _seized = _d.seizeSignerBonds();
-        _d.depositBeneficiary().transfer(_seized);  // Transfer whole amount
+        _d.depositOwner().transfer(_seized);  // Transfer whole amount
     }
 
     /// @notice     Anyone may notify the contract that signing group setup has timed out
@@ -197,7 +187,6 @@ library DepositFunding {
 
         bool _isFraud = _d.submitSignatureFraud(_v, _r, _s, _signedDigest, _preimage);
         require(_isFraud, "Signature is not fraudulent");
-        _d.seizeSignerBonds();
         _d.logFraudDuringSetup();
 
         // If the funding timeout has elapsed, punish the funder too!
@@ -332,14 +321,13 @@ library DepositFunding {
         // Write down the UTXO info and set to active. Congratulations :)
         _d.utxoSizeBytes = _valueBytes;
         _d.utxoOutpoint = _utxoOutpoint;
+        _d.fundedAt = block.timestamp;
 
         fundingTeardown(_d);
         _d.setActive();
         _d.logFunded();
 
         returnFunderBond(_d);
-
-        mintTBTC(_d);
 
         return true;
     }

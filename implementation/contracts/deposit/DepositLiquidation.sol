@@ -9,7 +9,6 @@ import {TBTCConstants} from "./TBTCConstants.sol";
 import {IBondedECDSAKeep} from "../external/IBondedECDSAKeep.sol";
 import {OutsourceDepositLogging} from "./OutsourceDepositLogging.sol";
 import {TBTCToken} from "../system/TBTCToken.sol";
-import {IUniswapExchange} from "../external/IUniswapExchange.sol";
 import {ITBTCSystem} from "../interfaces/ITBTCSystem.sol";
 
 library DepositLiquidation {
@@ -50,17 +49,17 @@ library DepositLiquidation {
     function getCollateralizationPercentage(DepositUtils.Deposit storage _d) public view returns (uint256) {
 
         // Determine value of the lot in wei
-        uint256 _oraclePrice = _d.fetchOraclePrice();
-        if (_oraclePrice == 0 || _oraclePrice > 10 ** 18) {
+        uint256 _price = _d.fetchBitcoinPrice();
+        if (_price == 0 || _price > 10 ** 18) {
             /*
               This is if a sat is worth 0 wei, or is worth 1 ether
               TODO: what should this behavior be?
             */
-            revert("Oracle returned a bad price");
+            revert("System returned a bad price");
         }
 
-        uint256 _lotSize = TBTCConstants.getLotSize();
-        uint256 _lotValue = _lotSize * _oraclePrice;
+        uint256 _lotSize = _d.lotSizeSatoshis;
+        uint256 _lotValue = _lotSize * _price;
 
         // Amount of wei the signers have
         uint256 _bondValue = _d.fetchBondAmount();
@@ -72,7 +71,7 @@ library DepositLiquidation {
     /// @notice         Starts signer liquidation due to fraud
     /// @dev            We first attempt to liquidate on chain, then by auction
     /// @param  _d      deposit storage pointer
-    function startSignerFraudLiquidation(DepositUtils.Deposit storage _d) public {
+    function startSignerFraudLiquidation(DepositUtils.Deposit storage _d) internal {
         _d.logStartedLiquidation(true);
 
         // Reclaim used state for gas savings
@@ -82,46 +81,30 @@ library DepositLiquidation {
         if (_d.auctionTBTCAmount() == 0) {
             // we came from the redemption flow
             _d.setLiquidated();
-            _d.requesterAddress.transfer(_seized);
+            _d.redeemerAddress.transfer(_seized);
             _d.logLiquidated();
             return;
         }
 
-        bool _liquidated = attemptToLiquidateOnchain(_d);
+        _d.liquidationInitiator = msg.sender;
+        _d.liquidationInitiated = block.timestamp;  // Store the timestamp for auction
 
-        if (_liquidated) {
-            _d.distributeBeneficiaryReward();
-            _d.setLiquidated();
-            _d.logLiquidated();
-            address(0).transfer(address(this).balance);  // burn it down
-        }
-        if (!_liquidated) {
-            _d.setFraudLiquidationInProgress();
-            _d.liquidationInitiated = block.timestamp;  // Store the timestamp for auction
-        }
+        _d.setFraudLiquidationInProgress();
+        
     }
 
     /// @notice         Starts signer liquidation due to abort or undercollateralization
     /// @dev            We first attempt to liquidate on chain, then by auction
     /// @param  _d      deposit storage pointer
-    function startSignerAbortLiquidation(DepositUtils.Deposit storage _d) public {
+    function startSignerAbortLiquidation(DepositUtils.Deposit storage _d) internal {
         _d.logStartedLiquidation(false);
         // Reclaim used state for gas savings
         _d.redemptionTeardown();
         _d.seizeSignerBonds();
 
-        bool _liquidated = attemptToLiquidateOnchain(_d);
-
-        if (_liquidated) {
-            _d.distributeBeneficiaryReward();
-            _d.pushFundsToKeepGroup(address(this).balance);
-            _d.setLiquidated();
-            _d.logLiquidated();
-        }
-        if (!_liquidated) {
-            _d.liquidationInitiated = block.timestamp;  // Store the timestamp for auction
-            _d.setFraudLiquidationInProgress();
-        }
+        _d.liquidationInitiated = block.timestamp;  // Store the timestamp for auction
+        _d.liquidationInitiator = msg.sender;
+        _d.setFraudLiquidationInProgress();
     }
 
     /// @notice                 Anyone can provide a signature that was not requested to prove fraud
@@ -201,7 +184,7 @@ library DepositLiquidation {
             "No input spending custodied UTXO found at given index"
         );
 
-        if (_d.requesterPKH != bytes20(0)) {
+        if (_d.redeemerPKH != bytes20(0)) {
             require(
                 validateRedeemerNotPaid(_d, _txOutputVector),
                 "Found an output paying the redeemer as requested"
@@ -211,7 +194,7 @@ library DepositLiquidation {
         startSignerFraudLiquidation(_d);
     }
 
-    /// @notice                 Search _txOutputVector for output paying the requestor
+    /// @notice                 Search _txOutputVector for output paying the redeemer
     /// @dev                    Require that outputs checked are witness
     /// @param  _d              Deposit storage pointer
     /// @param _txOutputVector  All transaction outputs prepended by the number of outputs encoded as a VarInt, max 0xFC(252) outputs
@@ -233,7 +216,7 @@ library DepositLiquidation {
             if (_output.extractValue() >= _requiredOutputValue
                 // extract the output flag and check that it is witness
                 && keccak256(_output.slice(8, 3)) == keccak256(hex"160014")
-                && keccak256(_output.extractHash()) == keccak256(abi.encodePacked(_d.requesterPKH))) {
+                && keccak256(_output.extractHash()) == keccak256(abi.encodePacked(_d.redeemerPKH))) {
                 return false;
             }
         }
@@ -250,26 +233,46 @@ library DepositLiquidation {
         _d.setLiquidated();
         _d.logLiquidated();
 
-        // Burn the outstanding TBTC
+        // send the TBTC to the TDT holder. If the TDT holder is the Vending Machine, burn it to maintain the peg.
+        address tdtHolder = _d.depositOwner();
+
         TBTCToken _tbtcToken = TBTCToken(_d.TBTCToken);
-        require(_tbtcToken.balanceOf(msg.sender) >= TBTCConstants.getLotSize(), "Not enough TBTC to cover outstanding debt");
-        _tbtcToken.burnFrom(msg.sender, TBTCConstants.getLotSize());  // burn minimal amount to cover size
+
+        uint256 lotSizeTbtc = _d.lotSizeTbtc();
+        require(_tbtcToken.balanceOf(msg.sender) >= lotSizeTbtc, "Not enough TBTC to cover outstanding debt");
+
+        if(tdtHolder == _d.VendingMachine){
+            _tbtcToken.burnFrom(msg.sender, lotSizeTbtc);  // burn minimal amount to cover size
+        }
+        else{
+            _tbtcToken.transferFrom(msg.sender, tdtHolder, lotSizeTbtc);
+        }
 
         // Distribute funds to auction buyer
         uint256 _valueToDistribute = _d.auctionValue();
         msg.sender.transfer(_valueToDistribute);
 
-        // Send any TBTC left to the beneficiary
-        _d.distributeBeneficiaryReward();
+        // Send any TBTC left to the Fee Rebate Token holder
+        _d.distributeFeeRebate();
 
-        // then if there are funds left, and it wasn't fraud, pay out the signers
-        if (address(this).balance > 0) {
+        // For fraud, pay remainder to the liquidation initiator.
+        // For non-fraud, split 50-50 between initiator and signers. if the transfer amount is 1, 
+        // division will yield a 0 value which causes a revert; instead, 
+        // we simply ignore such a tiny amount and leave some wei dust in escrow
+        uint256 contractEthBalance = address(this).balance;
+        address payable initiator = _d.liquidationInitiator;
+
+        if (initiator == address(0)){
+            initiator = address(0xdead);
+        }
+        if (contractEthBalance > 1) {
             if (_wasFraud) {
-                // Burn it
-                address(0).transfer(address(this).balance);
+                initiator.transfer(contractEthBalance);
             } else {
-                // Send it back
-                _d.pushFundsToKeepGroup(address(this).balance);
+                // There will always be a liquidation initiator.
+                uint256 split = contractEthBalance.div(2);
+                _d.pushFundsToKeepGroup(split);
+                initiator.transfer(split);
             }
         }
     }
@@ -279,7 +282,7 @@ library DepositLiquidation {
     /// @param  _d  deposit storage pointer
     function notifyCourtesyCall(DepositUtils.Deposit storage _d) public  {
         require(_d.inActive(), "Can only courtesy call from active state");
-        require(getCollateralizationPercentage(_d) < TBTCConstants.getUndercollateralizedPercent(), "Signers have sufficient collateral");
+        require(getCollateralizationPercentage(_d) < _d.undercollateralizedThresholdPercent, "Signers have sufficient collateral");
         _d.courtesyCallInitiated = block.timestamp;
         _d.setCourtesyCall();
         _d.logCourtesyCalled();
@@ -291,7 +294,7 @@ library DepositLiquidation {
     function exitCourtesyCall(DepositUtils.Deposit storage _d) public {
         require(_d.inCourtesyCall(), "Not currently in courtesy call");
         require(block.timestamp <= _d.fundedAt + TBTCConstants.getDepositTerm(), "Deposit is expiring");
-        require(getCollateralizationPercentage(_d) >= TBTCConstants.getUndercollateralizedPercent(), "Deposit is still undercollateralized");
+        require(getCollateralizationPercentage(_d) >= _d.undercollateralizedThresholdPercent, "Deposit is still undercollateralized");
         _d.setActive();
         _d.logExitedCourtesyCall();
     }
@@ -301,7 +304,7 @@ library DepositLiquidation {
     /// @param  _d  deposit storage pointer
     function notifyUndercollateralizedLiquidation(DepositUtils.Deposit storage _d) public {
         require(_d.inRedeemableState(), "Deposit not in active or courtesy call");
-        require(getCollateralizationPercentage(_d) < TBTCConstants.getSeverelyUndercollateralizedPercent(), "Deposit has sufficient collateral");
+        require(getCollateralizationPercentage(_d) < _d.severelyUndercollateralizedThresholdPercent, "Deposit has sufficient collateral");
         startSignerAbortLiquidation(_d);
     }
 
@@ -323,34 +326,5 @@ library DepositLiquidation {
         _d.setCourtesyCall();
         _d.logCourtesyCalled();
         _d.courtesyCallInitiated = block.timestamp;
-    }
-
-    /// @notice     Tries to liquidate the position on-chain using the signer bond
-    /// @dev        Calls out to other contracts, watch for re-entrance
-    /// @return     True if Liquidated, False otherwise
-    // TODO(liamz): check for re-entry
-    function attemptToLiquidateOnchain(
-        DepositUtils.Deposit storage _d
-    ) internal returns (bool) {
-        // Return early if there is no Uniswap TBTC Exchange.
-        IUniswapExchange exchange = IUniswapExchange(ITBTCSystem(_d.TBTCSystem).getTBTCUniswapExchange());
-        if(address(exchange) == address(0x0)) {
-            return false;
-        }
-
-        // Only liquidate if we can buy up enough TBTC to burn,
-        // otherwise go 100% for the falling-price auction
-        uint tbtcAmount = _d.liquidationTBTCAmount();
-        uint ethAmount = exchange.getEthToTokenOutputPrice(tbtcAmount);
-
-        if(address(this).balance < ethAmount) {
-            return false;
-        }
-
-        // Leverage uniswap’s frontrunning mitigation functionality.
-        uint deadline = block.timestamp;
-        exchange.ethToTokenSwapOutput.value(ethAmount)(tbtcAmount, deadline);
-
-        return true;
     }
 }
